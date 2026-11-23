@@ -7843,6 +7843,37 @@ class _AnthropicPrompt:
     native_reasoning: bool
     thinking_budget: int | None
     model_settings: object | None
+    compiled_grammar: object | None = None
+    native_response_format: dict | None = None
+    response_format_warning: str | None = None
+    reasoning_parser: str | None = None
+
+
+def _anthropic_response_format(output_config: dict | None) -> dict | None:
+    """Map Anthropic ``output_config.format`` to an OpenAI ``response_format``.
+
+    ``output_config.effort`` is not handled yet (#2796).
+    """
+    fmt = (output_config or {}).get("format")
+    if fmt is None:
+        return None
+    fmt_type = fmt.get("type") if isinstance(fmt, dict) else None
+    if fmt_type != "json_schema":
+        raise InvalidRequestError(
+            f"Unsupported output_config.format.type {fmt_type!r}; "
+            "only 'json_schema' is supported.",
+            field="output_config.format.type",
+        )
+    schema = fmt.get("schema")
+    if not isinstance(schema, dict):
+        raise InvalidRequestError(
+            "output_config.format.schema must be a JSON schema object.",
+            field="output_config.format.schema",
+        )
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "response", "schema": schema, "strict": True},
+    }
 
 
 async def _prepare_anthropic_prompt(
@@ -7953,6 +7984,38 @@ async def _prepare_anthropic_prompt(
 
     _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
 
+    # Structured output, as /v1/responses handles text.format. It runs before
+    # the system-message pass so the prompt-injection fallback is part of the
+    # prepared prompt, its cache key and the count_tokens result.
+    reasoning_parser = ms.reasoning_parser if ms else None
+    compiled_grammar = None
+    native_response_format = None
+    response_format_warning = None
+    response_format = _anthropic_response_format(
+        getattr(request, "output_config", None)
+    )
+    if response_format:
+        from .api.openai_models import ResponseFormat
+
+        _reject_diffusion_structured_outputs(engine, response_format=response_format)
+        native_response_format = _native_response_format(engine, response_format)
+        if native_response_format is None:
+            await engine.start()
+            reasoning_parser = _grammar_reasoning_parser(engine, reasoning_parser)
+            rf = ResponseFormat(**response_format)
+            compiled_grammar = _compile_grammar_for_request(
+                engine,
+                response_format=rf,
+                chat_template_kwargs=merged_ct_kwargs or None,
+                reasoning_parser=reasoning_parser,
+            )
+            if compiled_grammar is None:
+                # Same Warning header as the other endpoints (#1241).
+                response_format_warning = _response_format_warning_header(rf)
+                json_instruction = build_json_system_prompt(rf)
+                if json_instruction:
+                    messages = _inject_json_instruction(messages, json_instruction)
+
     # Merge MCP tools with user-provided Anthropic tools unless
     # tool_choice is {"type": "none"}, same as /v1/chat/completions.
     tools_disabled = getattr(request.tool_choice, "type", None) == "none"
@@ -8004,6 +8067,10 @@ async def _prepare_anthropic_prompt(
         native_reasoning=native_reasoning,
         thinking_budget=thinking_budget,
         model_settings=ms,
+        compiled_grammar=compiled_grammar,
+        native_response_format=native_response_format,
+        response_format_warning=response_format_warning,
+        reasoning_parser=reasoning_parser,
     )
 
 
@@ -8133,6 +8200,21 @@ async def create_anthropic_message(
             # names. Bound reasoning to its deadline, but do not turn it on.
             chat_kwargs["thinking_budget"] = _AUTO_MODE_CLASSIFIER_THINKING_BUDGET
 
+        # Add compiled grammar for output_config.format. With a reasoning
+        # parser the grammar has a thinking phase, so bound it the way the
+        # other endpoints do and let the grammar take over.
+        if prompt.compiled_grammar is not None:
+            chat_kwargs["compiled_grammar"] = prompt.compiled_grammar
+            if prompt.reasoning_parser and "thinking_budget" not in chat_kwargs:
+                default_budget = min(max_tokens // 2, 4096)
+                chat_kwargs["thinking_budget"] = default_budget
+                logger.debug(
+                    "Auto-set thinking_budget=%d for grammar-constrained request",
+                    default_budget,
+                )
+        if prompt.native_response_format is not None:
+            chat_kwargs["response_format"] = prompt.native_response_format
+
         if internal_tools:
             chat_kwargs["tools"] = internal_tools
 
@@ -8176,6 +8258,9 @@ async def create_anthropic_message(
         await _raise_if_llm_lease_abort_requested(lease)
         inference_request_id = str(uuid.uuid4())
         chat_kwargs["_request_id"] = inference_request_id
+        response_headers = {_REQUEST_ID_HEADER: inference_request_id}
+        if prompt.response_format_warning:
+            response_headers["Warning"] = prompt.response_format_warning
 
         if request.stream:
             return StreamingResponse(
@@ -8202,7 +8287,7 @@ async def create_anthropic_message(
                 headers={
                     "X-Accel-Buffering": "no",
                     "Cache-Control": "no-cache",
-                    _REQUEST_ID_HEADER: inference_request_id,
+                    **response_headers,
                 },
             )
 
@@ -8312,7 +8397,7 @@ async def create_anthropic_message(
             http_request,
             _build_anthropic_message(),
             lease=lease,
-            headers={_REQUEST_ID_HEADER: inference_request_id},
+            headers=response_headers,
         )
 
     except BaseException:
@@ -8357,6 +8442,7 @@ async def count_anthropic_tokens(
             tools=request.tools,
             tool_choice=request.tool_choice,
             thinking=request.thinking,
+            output_config=request.output_config,
         )
         prompt = await _prepare_anthropic_prompt(temp_request, engine, resolved_model)
         input_tokens, _ = await _prepare_prompt_off_loop(

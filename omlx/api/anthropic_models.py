@@ -235,6 +235,9 @@ class MessagesRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     tool_choice: ToolChoice | dict[str, Any] | None = None
     thinking: ThinkingConfig | None = None
+    # Structured output: only "format" is read. Kept a plain dict because
+    # Anthropic puts other keys here too ("effort" is not handled yet).
+    output_config: dict[str, Any] | None = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: dict[str, Any] | None = None
 
@@ -253,6 +256,8 @@ class TokenCountRequest(BaseModel):
     tools: list[AnthropicTool] | None = None
     tool_choice: ToolChoice | dict[str, Any] | None = None
     thinking: ThinkingConfig | None = None
+    # Counted only when its prompt-injection fallback adds text.
+    output_config: dict[str, Any] | None = None
 
 
 class TokenCountResponse(BaseModel):

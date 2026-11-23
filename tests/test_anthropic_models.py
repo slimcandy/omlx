@@ -569,6 +569,33 @@ class TestMessagesRequest:
                 max_tokens=1024,
             )
 
+    def test_request_output_config_kept(self):
+        """output_config.format survives parsing, with unknown keys kept."""
+        output_config = {
+            "format": {"type": "json_schema", "schema": {"type": "object"}},
+            "effort": "high",
+            "future_key": {"nested": True},
+        }
+        req = MessagesRequest.model_validate(
+            {
+                "model": "claude-3-sonnet",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "output_config": output_config,
+            }
+        )
+
+        assert req.output_config == output_config
+
+    def test_request_output_config_defaults_to_none(self):
+        req = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+
+        assert req.output_config is None
+
 
 class TestTokenCounting:
     """Tests for token counting models."""
@@ -581,6 +608,16 @@ class TestTokenCounting:
         )
 
         assert req.model == "claude-3-sonnet"
+
+    def test_token_count_request_accepts_output_config(self):
+        output_config = {"format": {"type": "json_schema", "schema": {}}}
+        req = TokenCountRequest(
+            model="claude-3-sonnet",
+            messages=[AnthropicMessage(role="user", content="Hello")],
+            output_config=output_config,
+        )
+
+        assert req.output_config == output_config
 
     def test_token_count_response(self):
         """Test creating token count response."""
