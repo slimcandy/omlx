@@ -1792,6 +1792,258 @@ class TestAnthropicMessagesEndpoint:
         assert ct_kwargs.get("enable_thinking") is True
 
 
+_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["zz_code"],
+    "properties": {"zz_code": {"type": "string", "enum": ["BEETLE", "SPIDER"]}},
+}
+_OUTPUT_JSON = '{"zz_code": "BEETLE"}'
+
+
+class _FakeGrammarCompiler:
+    def __init__(self):
+        self.schemas = []
+        self.grammar = object()
+
+    def compile_json_schema(self, schema, **kwargs):
+        self.schemas.append(json.loads(schema))
+        return self.grammar
+
+
+class TestAnthropicOutputConfig:
+    """output_config.format (structured output) on /v1/messages."""
+
+    @pytest.fixture
+    def captured(self, mock_llm_engine):
+        captured = {}
+
+        async def chat(messages, **kwargs):
+            captured.update(messages=messages, kwargs=kwargs)
+            return MockGenerationOutput(text=_OUTPUT_JSON)
+
+        async def stream_chat(messages, **kwargs):
+            captured.update(messages=messages, kwargs=kwargs)
+            yield MockGenerationOutput(text=_OUTPUT_JSON, new_text=_OUTPUT_JSON)
+
+        mock_llm_engine.chat = chat
+        mock_llm_engine.stream_chat = stream_chat
+        return captured
+
+    @pytest.fixture
+    def compiler(self, monkeypatch):
+        compiler = _FakeGrammarCompiler()
+        monkeypatch.setattr(
+            MockBaseEngine, "grammar_compiler", property(lambda self: compiler)
+        )
+        return compiler
+
+    @staticmethod
+    def _body(stream=False, **extra):
+        return {
+            "model": "test-model",
+            "max_tokens": 300,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": stream,
+            **extra,
+        }
+
+    @staticmethod
+    def _output_config(**fmt):
+        return {"format": {"type": "json_schema", "schema": _OUTPUT_SCHEMA, **fmt}}
+
+    @staticmethod
+    def _text(response, stream):
+        if not stream:
+            data = response.json()
+            assert data["stop_reason"] == "end_turn"
+            return "".join(b["text"] for b in data["content"] if b["type"] == "text")
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        stop = next(e for e in events if e["type"] == "message_delta")
+        assert stop["delta"]["stop_reason"] == "end_turn"
+        return "".join(
+            e["delta"]["text"]
+            for e in events
+            if e["type"] == "content_block_delta" and e["delta"]["type"] == "text_delta"
+        )
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_json_schema_compiles_grammar_for_engine(
+        self, client, captured, compiler, stream
+    ):
+        response = client.post(
+            "/v1/messages",
+            json=self._body(stream, output_config=self._output_config()),
+        )
+
+        assert response.status_code == 200
+        assert "Warning" not in response.headers
+        assert json.loads(self._text(response, stream)) == {"zz_code": "BEETLE"}
+        assert compiler.schemas == [_OUTPUT_SCHEMA]
+        assert captured["kwargs"]["compiled_grammar"] is compiler.grammar
+        # Enforced by the grammar, so no JSON instruction in the prompt.
+        assert [m["role"] for m in captured["messages"]] == ["user"]
+        # No reasoning parser configured: no auto thinking budget.
+        assert "thinking_budget" not in captured["kwargs"]
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_grammar_with_reasoning_parser_sets_thinking_budget(
+        self, client, captured, monkeypatch, stream
+    ):
+        from omlx.model_settings import ModelSettings
+
+        grammar = object()
+        compile_calls = []
+
+        def compile_grammar(engine, **kwargs):
+            compile_calls.append(kwargs)
+            return grammar
+
+        monkeypatch.setattr(
+            "omlx.server.get_model_settings_for_request",
+            lambda model_id: ModelSettings(reasoning_parser="qwen3"),
+        )
+        monkeypatch.setattr("omlx.server._compile_grammar_for_request", compile_grammar)
+
+        response = client.post(
+            "/v1/messages",
+            json=self._body(
+                stream,
+                output_config=self._output_config(),
+                thinking={"type": "disabled"},
+            ),
+        )
+
+        assert response.status_code == 200
+        assert compile_calls[0]["reasoning_parser"] == "qwen3"
+        assert compile_calls[0]["chat_template_kwargs"]["enable_thinking"] is False
+        assert captured["kwargs"]["compiled_grammar"] is grammar
+        assert captured["kwargs"]["thinking_budget"] == 150  # min(300 // 2, 4096)
+
+    def test_explicit_thinking_budget_wins_over_auto_budget(
+        self, client, captured, monkeypatch
+    ):
+        from omlx.model_settings import ModelSettings
+
+        monkeypatch.setattr(
+            "omlx.server.get_model_settings_for_request",
+            lambda model_id: ModelSettings(reasoning_parser="qwen3"),
+        )
+        monkeypatch.setattr(
+            "omlx.server._compile_grammar_for_request", lambda engine, **kw: object()
+        )
+
+        response = client.post(
+            "/v1/messages",
+            json=self._body(
+                output_config=self._output_config(),
+                thinking={"type": "enabled", "budget_tokens": 64},
+            ),
+        )
+
+        assert response.status_code == 200
+        assert captured["kwargs"]["thinking_budget"] == 64
+
+    @pytest.mark.parametrize(
+        "output_config",
+        [None, {}, {"effort": "high"}, {"format": None}],
+        ids=["absent", "empty", "effort-only", "format-null"],
+    )
+    def test_without_format_kwargs_unchanged(
+        self, client, captured, monkeypatch, output_config
+    ):
+        def fail_compile(*args, **kwargs):
+            raise AssertionError("no grammar without output_config.format")
+
+        monkeypatch.setattr("omlx.server._compile_grammar_for_request", fail_compile)
+
+        baseline = client.post("/v1/messages", json=self._body())
+        baseline_kwargs = dict(captured["kwargs"])
+        extra = {} if output_config is None else {"output_config": output_config}
+        response = client.post("/v1/messages", json=self._body(**extra))
+
+        assert baseline.status_code == response.status_code == 200
+        assert "Warning" not in response.headers
+        for kwargs in (baseline_kwargs, captured["kwargs"]):
+            assert "compiled_grammar" not in kwargs
+            assert "response_format" not in kwargs
+            assert "thinking_budget" not in kwargs
+            kwargs.pop("_request_id")
+        assert captured["kwargs"] == baseline_kwargs
+        assert [m["role"] for m in captured["messages"]] == ["user"]
+
+    @pytest.mark.parametrize(
+        ("fmt", "field"),
+        [
+            ({"type": "json_object"}, "output_config.format.type"),
+            ({"type": "regex", "pattern": "a+"}, "output_config.format.type"),
+            ("json_schema", "output_config.format.type"),
+            ({"type": "json_schema"}, "output_config.format.schema"),
+        ],
+    )
+    @pytest.mark.parametrize("endpoint", ["/v1/messages", "/v1/messages/count_tokens"])
+    def test_unsupported_format_rejected(self, client, captured, endpoint, fmt, field):
+        response = client.post(endpoint, json=self._body(output_config={"format": fmt}))
+
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["param"] == field
+        assert "output_config.format" in error["message"]
+        assert "kwargs" not in captured
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_grammar_unavailable_falls_back_to_prompt(self, client, captured, stream):
+        # MockBaseEngine.grammar_compiler is None: no xgrammar.
+        response = client.post(
+            "/v1/messages",
+            json=self._body(
+                stream,
+                system="Be brief.",
+                output_config=self._output_config(),
+            ),
+        )
+
+        assert response.status_code == 200
+        assert response.headers["Warning"].startswith('199 omlx "')
+        # The mapped response_format is strict, like Anthropic's.
+        assert "strict json_schema not enforced" in response.headers["Warning"]
+        assert "compiled_grammar" not in captured["kwargs"]
+        system = captured["messages"][0]
+        assert system["role"] == "system"
+        assert system["content"].startswith("Be brief.\n\n")
+        assert '"zz_code"' in system["content"]
+        assert json.loads(self._text(response, stream)) == {"zz_code": "BEETLE"}
+
+    def test_count_tokens_matches_fallback_prompt(self, client, monkeypatch):
+        def count(**extra):
+            response = client.post(
+                "/v1/messages/count_tokens",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    **extra,
+                },
+            )
+            assert response.status_code == 200
+            return response.json()["input_tokens"]
+
+        plain = count()
+        # The fallback injects a JSON instruction, which the count includes.
+        assert count(output_config=self._output_config()) > plain
+
+        compiler = _FakeGrammarCompiler()
+        monkeypatch.setattr(
+            MockBaseEngine, "grammar_compiler", property(lambda self: compiler)
+        )
+        # An enforced grammar adds nothing to the prompt.
+        assert count(output_config=self._output_config()) == plain
+
+
 class TestEmbeddingsEndpoint:
     """Tests for the /v1/embeddings endpoint."""
 
